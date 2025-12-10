@@ -2,7 +2,10 @@ module github.com/viant/sqlite-vec
 
 go 1.24.0
 
-require modernc.org/sqlite v1.40.2-0.20251208121757-c233febc9136
+require (
+	github.com/viant/vec v0.1.1-0.20240628004145-aad750556278
+	modernc.org/sqlite v1.40.2-0.20251208121757-c233febc9136
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -16,3 +19,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/viant/vec => ../vec
