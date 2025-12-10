@@ -15,6 +15,7 @@ type Index struct {
 	DB          *sql.DB
 	VirtualName string
 	ShadowName  string
+	DatasetID   string
 	Embed       EmbedFunc
 }
 
@@ -23,7 +24,7 @@ type Index struct {
 // The shadow table name is derived using ShadowTableName. The caller is
 // responsible for having created both the virtual table and its shadow table
 // schema (see README examples).
-func NewIndex(db *sql.DB, virtualTable string, embed EmbedFunc) (*Index, error) {
+func NewIndex(db *sql.DB, virtualTable string, datasetID string, embed EmbedFunc) (*Index, error) {
 	if db == nil {
 		return nil, fmt.Errorf("vecutil: db is nil")
 	}
@@ -34,6 +35,7 @@ func NewIndex(db *sql.DB, virtualTable string, embed EmbedFunc) (*Index, error) 
 		DB:          db,
 		VirtualName: virtualTable,
 		ShadowName:  ShadowTableName(virtualTable),
+		DatasetID:   datasetID,
 		Embed:       embed,
 	}, nil
 }
@@ -66,7 +68,7 @@ func (ix *Index) UpsertDocumentsText(ctx context.Context, docs []Document) error
 		return nil
 	}
 	for _, d := range docs {
-		if err := UpsertShadowDocument(ctx, ix.DB, ix.ShadowName, ix.Embed, d.ID, d.Content, d.Meta); err != nil {
+		if err := UpsertShadowDocument(ctx, ix.DB, ix.ShadowName, ix.Embed, ix.DatasetID, d.ID, d.Content, d.Meta); err != nil {
 			return err
 		}
 	}
@@ -83,9 +85,9 @@ func (ix *Index) DeleteDocuments(ctx context.Context, ids []string) error {
 	if ix.DB == nil {
 		return fmt.Errorf("vecutil: DB is nil on Index")
 	}
-	stmt := fmt.Sprintf("DELETE FROM %s WHERE id = ?", ix.ShadowName)
+	stmt := fmt.Sprintf("DELETE FROM %s WHERE dataset_id = ? AND id = ?", ix.ShadowName)
 	for _, id := range ids {
-		if _, err := ix.DB.ExecContext(ctx, stmt, id); err != nil {
+		if _, err := ix.DB.ExecContext(ctx, stmt, ix.DatasetID, id); err != nil {
 			return err
 		}
 	}
@@ -116,13 +118,13 @@ func (ix *Index) QueryText(ctx context.Context, query string, k int) ([]Match, e
 	}
 
 	// 2. Use the vec virtual table to obtain ordered ids.
-	base := fmt.Sprintf("SELECT value FROM %s WHERE value MATCH ?", ix.VirtualName)
+	base := fmt.Sprintf("SELECT doc_id FROM %s WHERE dataset_id = ? AND doc_id MATCH ?", ix.VirtualName)
 	var rows *sql.Rows
 	if k > 0 {
 		q := base + " LIMIT ?"
-		rows, err = ix.DB.QueryContext(ctx, q, qBlob, k)
+		rows, err = ix.DB.QueryContext(ctx, q, ix.DatasetID, qBlob, k)
 	} else {
-		rows, err = ix.DB.QueryContext(ctx, base, qBlob)
+		rows, err = ix.DB.QueryContext(ctx, base, ix.DatasetID, qBlob)
 	}
 	if err != nil {
 		return nil, err
@@ -147,10 +149,10 @@ func (ix *Index) QueryText(ctx context.Context, query string, k int) ([]Match, e
 	// 3. For each id, load content/meta/embedding and compute cosine similarity
 	//    in Go. This keeps provider logic in the embedding layer while still
 	//    exposing a score similar to hosted vector DBs.
-	stmt := fmt.Sprintf("SELECT content, meta, embedding FROM %s WHERE id = ?", ix.ShadowName)
+	stmt := fmt.Sprintf("SELECT content, meta, embedding FROM %s WHERE dataset_id = ? AND id = ?", ix.ShadowName)
 	out := make([]Match, 0, len(ids))
 	for _, id := range ids {
-		row := ix.DB.QueryRowContext(ctx, stmt, id)
+		row := ix.DB.QueryRowContext(ctx, stmt, ix.DatasetID, id)
 		var content, meta string
 		var embBlob []byte
 		if err := row.Scan(&content, &meta, &embBlob); err != nil {
@@ -173,4 +175,3 @@ func (ix *Index) QueryText(ctx context.Context, query string, k int) ([]Match, e
 	}
 	return out, nil
 }
-

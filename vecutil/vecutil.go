@@ -21,7 +21,8 @@ type EmbedFunc func(ctx context.Context, text string) ([]float32, error)
 // which prefixes the table name with _vec_.
 //
 // For example:
-//   ShadowTableName("vec_basic") == "_vec_vec_basic".
+//
+//	ShadowTableName("vec_basic") == "_vec_vec_basic".
 //
 // Schema/database qualification (e.g. main.) is handled by SQLite; this helper
 // only returns the bare table name.
@@ -34,10 +35,11 @@ func ShadowTableName(virtualTable string) string {
 //
 // The shadowTable is typically derived via ShadowTableName or known
 // explicitly. It is assumed to follow the schema used by sqlite-vec tests:
-//   id        TEXT PRIMARY KEY
-//   content   TEXT
-//   meta      TEXT
-//   embedding BLOB
+//
+//	id        TEXT PRIMARY KEY
+//	content   TEXT
+//	meta      TEXT
+//	embedding BLOB
 //
 // Table and column names are interpolated into SQL; callers should ensure
 // that shadowTable is trusted and not derived from untrusted input.
@@ -46,6 +48,7 @@ func UpsertShadowDocument(
 	db *sql.DB,
 	shadowTable string,
 	embed EmbedFunc,
+	datasetID string,
 	id, content, meta string,
 ) error {
 	if db == nil {
@@ -65,14 +68,15 @@ func UpsertShadowDocument(
 	}
 
 	stmt := fmt.Sprintf(`
-INSERT INTO %s(id, content, meta, embedding)
-VALUES (?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
+INSERT INTO %s(dataset_id, id, content, meta, embedding)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(dataset_id, id) DO UPDATE SET
+  dataset_id = excluded.dataset_id,
   content = excluded.content,
   meta = excluded.meta,
   embedding = excluded.embedding`, shadowTable)
 
-	_, err = db.ExecContext(ctx, stmt, id, content, meta, blob)
+	_, err = db.ExecContext(ctx, stmt, datasetID, id, content, meta, blob)
 	return err
 }
 
@@ -84,10 +88,11 @@ func UpsertVirtualTableDocument(
 	db *sql.DB,
 	virtualTable string,
 	embed EmbedFunc,
+	datasetID string,
 	id, content, meta string,
 ) error {
 	shadow := ShadowTableName(virtualTable)
-	return UpsertShadowDocument(ctx, db, shadow, embed, id, content, meta)
+	return UpsertShadowDocument(ctx, db, shadow, embed, datasetID, id, content, meta)
 }
 
 // MatchText executes a MATCH query against a vec virtual table by first
@@ -101,6 +106,7 @@ func MatchText(
 	db *sql.DB,
 	virtualTable string,
 	embed EmbedFunc,
+	datasetID string,
 	query string,
 	limit int,
 ) ([]string, error) {
@@ -120,13 +126,13 @@ func MatchText(
 		return nil, err
 	}
 
-	base := fmt.Sprintf("SELECT value FROM %s WHERE value MATCH ?", virtualTable)
+	base := fmt.Sprintf("SELECT doc_id FROM %s WHERE dataset_id = ? AND doc_id MATCH ?", virtualTable)
 	var rows *sql.Rows
 	if limit > 0 {
 		q := base + " LIMIT ?"
-		rows, err = db.QueryContext(ctx, q, blob, limit)
+		rows, err = db.QueryContext(ctx, q, datasetID, blob, limit)
 	} else {
-		rows, err = db.QueryContext(ctx, base, blob)
+		rows, err = db.QueryContext(ctx, base, datasetID, blob)
 	}
 	if err != nil {
 		return nil, err
@@ -146,4 +152,3 @@ func MatchText(
 	}
 	return ids, nil
 }
-
