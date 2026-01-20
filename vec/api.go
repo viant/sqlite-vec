@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +34,142 @@ type Table struct {
 	mu   sync.RWMutex
 	idxs map[string]idxapi.Index // cached per-dataset index
 
-	indexKind string // "brute" (default) or "cover"
+	indexKind string // "auto" (default), "brute", or "cover"
+	coverOpts coverOptions
+}
+
+type indexOptions struct {
+	kind  string
+	cover coverOptions
+}
+
+type coverOptions struct {
+	base         float32
+	useBound     bool
+	bound        covidx.BoundStrategy
+	useDistance  bool
+	distance     covidx.DistanceFunction
+	parallel     int
+	autoParallel bool
+}
+
+const (
+	defaultIndexKind            = "auto"
+	autoCoverMinDocs            = 4000
+	autoCoverMinDim             = 64
+	autoCoverMinDensity float64 = 16
+)
+
+func (c coverOptions) toIndexOptions() []covidx.Option {
+	var opts []covidx.Option
+	if c.base > 1 {
+		opts = append(opts, covidx.WithBase(c.base))
+	}
+	if c.useBound {
+		opts = append(opts, covidx.WithBoundStrategy(c.bound))
+	}
+	if c.useDistance {
+		opts = append(opts, covidx.WithDistance(c.distance))
+	}
+	switch {
+	case c.autoParallel:
+		opts = append(opts, covidx.WithBuildParallelism(runtime.GOMAXPROCS(0)))
+	case c.parallel > 0:
+		opts = append(opts, covidx.WithBuildParallelism(c.parallel))
+	}
+	return opts
+}
+
+func (t *Table) newCoverIndex() *covidx.Index {
+	return covidx.New(t.coverOpts.toIndexOptions()...)
+}
+
+func (t *Table) resolveIndexKind(docCount, dim int) string {
+	switch t.indexKind {
+	case "cover", "brute":
+		return t.indexKind
+	case "auto", "":
+	default:
+		if t.indexKind != "auto" && t.indexKind != "" {
+			return t.indexKind
+		}
+	}
+	if docCount >= autoCoverMinDocs && dim >= autoCoverMinDim {
+		if dim > 0 {
+			density := float64(docCount) / float64(dim)
+			if density >= autoCoverMinDensity {
+				return "cover"
+			}
+		}
+	}
+	return "brute"
+}
+
+func parseIndexOptions(args []string) indexOptions {
+	opts := indexOptions{
+		kind:  defaultIndexKind,
+		cover: coverOptions{},
+	}
+	for _, raw := range args {
+		a := strings.TrimSpace(raw)
+		if a == "" {
+			continue
+		}
+		parts := strings.SplitN(a, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		val := strings.TrimSpace(parts[1])
+		switch key {
+		case "index":
+			switch strings.ToLower(val) {
+			case "cover", "brute", "auto":
+				opts.kind = strings.ToLower(val)
+			}
+		case "cover_base":
+			if f, err := strconv.ParseFloat(val, 32); err == nil && f > 1 {
+				opts.cover.base = float32(f)
+			}
+		case "cover_bound":
+			switch strings.ToLower(val) {
+			case "level", "boundlevel":
+				opts.cover.bound = covidx.BoundLevel
+				opts.cover.useBound = true
+			case "per_node", "pernode", "node":
+				opts.cover.bound = covidx.BoundPerNode
+				opts.cover.useBound = true
+			}
+		case "cover_distance":
+			switch strings.ToLower(val) {
+			case "cos", "cosine":
+				opts.cover.distance = covidx.DistanceFunctionCosine
+				opts.cover.useDistance = true
+			case "l2", "euclidean":
+				opts.cover.distance = covidx.DistanceFunctionEuclidean
+				opts.cover.useDistance = true
+			}
+		case "cover_parallel":
+			lower := strings.ToLower(val)
+			switch lower {
+			case "", "0", "off":
+				opts.cover.parallel = 0
+				opts.cover.autoParallel = false
+			case "auto":
+				opts.cover.autoParallel = true
+				opts.cover.parallel = 0
+			default:
+				if n, err := strconv.Atoi(lower); err == nil {
+					if n < 0 {
+						n = 0
+					}
+					opts.cover.parallel = n
+					opts.cover.autoParallel = false
+				}
+			}
+		}
+	}
+	return opts
 }
 
 // Global registry of active tables keyed by shadow name for cache invalidation.
@@ -174,10 +310,12 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(dataset_id TEXT, %s TEXT, match_score REAL HIDDEN)", args[2], col)); err != nil {
 		return nil, err
 	}
+	opts := parseIndexOptions(args[optStart:])
 	t := &Table{db: m.db, dbName: args[1], tableName: args[2], idxs: make(map[string]idxapi.Index)}
 	// Initialize shadow name eagerly so subsequent statements on the same connection work.
 	t.shadow = t.qualifiedShadow()
-	t.indexKind = parseIndexKind(args[optStart:])
+	t.indexKind = opts.kind
+	t.coverOpts = opts.cover
 	// Defer vector_storage creation until first use to avoid cross-connection DDL during xCreate.
 	trackTable(t)
 	return t, nil
@@ -202,11 +340,13 @@ func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(dataset_id TEXT, %s TEXT, match_score REAL HIDDEN)", args[2], col)); err != nil {
 		return nil, err
 	}
+	opts := parseIndexOptions(args[optStart:])
 	t := &Table{db: m.db, dbName: args[1], tableName: args[2], idxs: make(map[string]idxapi.Index)}
 	// Reconstruct shadow name and ensure vector_storage exists.
 	t.shadow = t.qualifiedShadow()
 	// Parse options if provided (args mirror Create's argv).
-	t.indexKind = parseIndexKind(args[optStart:])
+	t.indexKind = opts.kind
+	t.coverOpts = opts.cover
 	// Defer vector_storage creation until first use.
 	trackTable(t)
 	return t, nil
@@ -538,13 +678,12 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 	hasPersisted := (err == nil && len(blob) > 0)
 	if hasPersisted {
 		var idx idxapi.Index
-		switch t.indexKind {
-		case "cover":
-			c := &covidx.Index{}
+		if isCoverBlob(blob) {
+			c := t.newCoverIndex()
 			if err := c.UnmarshalBinary(blob); err == nil {
 				idx = c
 			}
-		default:
+		} else {
 			b := &bruteforce.Index{}
 			if err := b.UnmarshalBinary(blob); err == nil {
 				idx = b
@@ -600,9 +739,14 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 	}
 
 	var built idxapi.Index
-	switch t.indexKind {
+	dim := 0
+	if len(vecs) > 0 {
+		dim = len(vecs[0])
+	}
+	resolved := t.resolveIndexKind(len(ids), dim)
+	switch resolved {
 	case "cover":
-		c := &covidx.Index{}
+		c := t.newCoverIndex()
 		if err := c.Build(ids, vecs); err != nil {
 			return nil, err
 		}
@@ -691,20 +835,6 @@ func quoteLiteral(s string) string {
 	return "'" + escaped + "'"
 }
 
-func parseIndexKind(args []string) string {
-	kind := "brute"
-	for _, a := range args {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
-		if strings.HasPrefix(a, "index=") {
-			v := strings.TrimSpace(strings.TrimPrefix(a, "index="))
-			switch v {
-			case "cover", "brute":
-				kind = v
-			}
-		}
-	}
-	return kind
+func isCoverBlob(blob []byte) bool {
+	return len(blob) >= 4 && string(blob[:4]) == "COV1"
 }

@@ -166,6 +166,40 @@ func main() {
 > For real deployments, shadow tables live in MySQL (or another upstream DB) and
 > replicate into SQLite via `vecsync`. The snippet above is only for local experiments.
 
+### Virtual table options
+
+Pass tuning flags directly in the `USING vec(...)` clause:
+
+```sql
+CREATE VIRTUAL TABLE vec_docs USING vec(
+  doc_id,
+  index=cover,
+  cover_base=1.4,
+  cover_bound=level,
+  cover_distance=euclidean,
+  cover_parallel=auto
+);
+```
+
+Available keys (all optional):
+
+- `index=auto|cover|brute` – choose the index implementation (`auto` default).
+- `cover_base=<float>` – override the cover-tree base (>1). Larger bases produce
+  shallower trees (faster builds) with looser bounds; smaller bases do the opposite.
+- `cover_bound=per_node|level` – pick the pruning strategy (per-node cached radii
+  vs level-derived bounds). Default is `per_node`.
+- `cover_distance=cosine|euclidean` – set the distance metric used for MATCH queries
+  when the cover index rebuilds.
+- `cover_parallel=auto|N|off` – parallelize the vector-cloning phase before inserts.
+  `auto` uses `GOMAXPROCS`, a positive integer forces that worker count, and `off`
+  (or 0) keeps the classic single-threaded build.
+
+Changing any of these settings requires dropping cached blobs from `vector_storage`
+so the next query rebuilds with the new parameters. When `index=auto` (default),
+`vec` builds a cover tree once a dataset has at least ~4k embedded rows, vectors
+of 64+ dimensions, and a document-to-dimension ratio above ~16; smaller or sparse
+datasets stay on the brute-force index.
+
 ---
 
 ## Shadow tables & datasets
@@ -199,10 +233,16 @@ Key rules:
 
 ### Index persistence
 
-`vec` builds a brute-force (or experimental cover-tree) index per dataset slice
-and persists it in `vector_storage`. Triggers installed by `vec` delete the
-corresponding `(shadow_table_name, dataset_id)` blob whenever shadow rows change,
-forcing the next `MATCH` to rebuild.
+`vec` builds a brute-force (or cover-tree) index per dataset slice and persists
+it in `vector_storage`. Stored blobs are automatically detected at load time:
+
+- **Legacy** brute-force format (dimension, row count, repeated id+vector data).
+- **COV1** cover-tree format (magic header `COV1`, version, dimension, encoded
+  tree/values). This is the default when the cover index is used.
+
+Existing brute-force blobs continue to load without changes. Triggers installed
+by `vec` delete the `(shadow_table_name, dataset_id)` blob whenever shadow rows
+change, forcing the next `MATCH` to rebuild.
 
 ---
 
@@ -279,6 +319,39 @@ trigger definitions consistent across deployments.
   Safe to delete rows manually; `vec` will rebuild on the next query.
 - **Monitoring:** Track `vec_sync_state.last_scn` to ensure replicas keep up with
   upstream ingestion.
+- **Benchmarking indexes:** Run `go test ./index -bench=.` to compare brute-force
+  vs cover-tree builds/queries on your hardware before choosing a default.
+
+### Cover index tuning
+
+`index/cover` now exposes an option-friendly constructor so you can experiment
+without editing the module:
+
+- `cover.New(cover.WithBase(1.4))` tweaks the geometric base (fan-out). Larger
+  bases create shallower trees (faster builds) at the cost of looser bounds.
+- `cover.WithBoundStrategy(cover.BoundLevel)` switches the pruning heuristic
+  used at query time (less bookkeeping, slightly lower recall).
+- `cover.WithBuildParallelism(n)` parallelizes the vector cloning + magnitude
+  phase before sequential inserts. Useful only when copying embeddings dominates
+  build time; the tree itself still inserts serially.
+
+Benchmarks capture all of the above. Run:
+
+```bash
+env GOPROXY=off GOSUMDB=off GOCACHE=/tmp/sqlite-vec-gocache GOENV=off \
+  go test ./index -bench=IndexBuild -run=^$
+```
+
+Sample (Apple M1 Max):
+
+```
+BenchmarkIndexBuild/cover_50k_128d-10           ~24 ms/op
+BenchmarkIndexBuild/cover_parallel_50k_128d-10  ~37 ms/op
+```
+
+The parallel variant only accelerates workloads where embedding clones dwarf the
+tree insert cost. Keep the default sequential build unless profiles show the
+copy step as the bottleneck.
 
 ---
 

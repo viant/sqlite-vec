@@ -4,6 +4,8 @@ package tree
 
 import (
 	"container/heap"
+	"encoding/binary"
+	"io"
 	"math"
 	"sort"
 	"sync"
@@ -56,6 +58,13 @@ func NewTree[T any](base float32, distanceFn DistanceFunction) *Tree[T] {
 // SetBoundStrategy switches the pruning strategy at runtime.
 func (t *Tree[T]) SetBoundStrategy(s BoundStrategy) { t.boundStrategy = s }
 
+// DistanceFunction reports the configured distance metric.
+func (t *Tree[T]) DistanceFunction() DistanceFunction {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.distanceFuncName
+}
+
 // Insert adds a new value/vector pair to the tree and returns its index.
 func (t *Tree[T]) Insert(value T, point *Point) int32 {
 	t.mu.Lock()
@@ -69,10 +78,10 @@ func (t *Tree[T]) Insert(value T, point *Point) int32 {
 		point.Magnitude = search.Float32s(point.Vector).Magnitude()
 	}
 	if t.root == nil {
-		node := NewNode(point, 0, t.base)
+		node := Node{level: 0, baseLevel: 1, point: point}
 		t.root = &node
 	} else {
-		t.insert(t.root, point, 0)
+		t.insert(t.root, point, 0, 1)
 	}
 	t.version++
 	return point.index
@@ -113,29 +122,64 @@ func (t *Tree[T]) Values(points []*Point) []T {
 	return result
 }
 
-func (t *Tree[T]) insert(node *Node, point *Point, level int32) {
+// ForEach visits each unique value/point pair.
+func (t *Tree[T]) ForEach(fn func(value T, point *Point)) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.root == nil {
+		return
+	}
+	visited := make(map[int32]struct{})
+	var walk func(*Node)
+	walk = func(n *Node) {
+		if n == nil {
+			return
+		}
+		if _, ok := visited[n.point.index]; ok {
+			return
+		}
+		visited[n.point.index] = struct{}{}
+		fn(t.values.value(n.point.index), n.point)
+		for i := range n.children {
+			walk(&n.children[i])
+		}
+	}
+	walk(t.root)
+}
+
+func (t *Tree[T]) insert(node *Node, point *Point, level int32, baseLevel float32) {
+	if baseLevel <= 0 {
+		baseLevel = float32(math.Pow(float64(t.base), float64(level)))
+	}
 	for {
-		baseLevel := float32(math.Pow(float64(t.base), float64(level)))
 		distance := t.distanceFunc(point, node.point)
 		if distance < baseLevel {
 			inserted := false
+			nextLevel := baseLevel / t.base
 			for i := range node.children {
 				child := &node.children[i]
 				if t.distanceFunc(point, child.point) < baseLevel {
 					node = child
 					level--
+					baseLevel = nextLevel
 					inserted = true
 					break
 				}
 			}
 			if !inserted {
-				node.children = append(node.children, NewNode(point, level-1, t.base))
+				childLevel := level - 1
+				childBase := nextLevel
+				if childBase <= 0 {
+					childBase = float32(math.Pow(float64(t.base), float64(childLevel)))
+				}
+				node.children = append(node.children, Node{level: childLevel, baseLevel: childBase, point: point})
 				return
 			}
 		} else {
 			level++
+			baseLevel *= t.base
 			if level > node.level {
-				newRoot := NewNode(point, level, t.base)
+				newRoot := Node{level: level, baseLevel: baseLevel, point: point}
 				newRoot.children = append(newRoot.children, *t.root)
 				t.root = &newRoot
 				return
@@ -295,6 +339,197 @@ func (t *Tree[T]) boundRadius(n *Node) float32 {
 		return t.levelCoverRadius(n)
 	}
 	return t.nodeCoverRadius(n)
+}
+
+// EncodeBinary writes the tree (structure + values) using the provided encoder.
+func (t *Tree[T]) EncodeBinary(w io.Writer, encodeValue func(io.Writer, T) error) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if err := binary.Write(w, binary.LittleEndian, t.base); err != nil {
+		return err
+	}
+	if err := writeString(w, string(t.distanceFuncName)); err != nil {
+		return err
+	}
+	hasRoot := byte(0)
+	if t.root != nil {
+		hasRoot = 1
+	}
+	if err := binary.Write(w, binary.LittleEndian, hasRoot); err != nil {
+		return err
+	}
+	if hasRoot == 0 {
+		return nil
+	}
+	return t.encodeNode(w, t.root, encodeValue)
+}
+
+// DecodeBinary reconstructs the tree from the binary stream.
+func (t *Tree[T]) DecodeBinary(r io.Reader, decodeValue func(io.Reader) (T, error)) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var base float32
+	if err := binary.Read(r, binary.LittleEndian, &base); err != nil {
+		return err
+	}
+	name, err := readString(r)
+	if err != nil {
+		return err
+	}
+	t.base = base
+	t.distanceFuncName = DistanceFunction(name)
+	if fn := t.distanceFuncName.Function(); fn != nil {
+		t.distanceFunc = fn
+	} else {
+		t.distanceFunc = DistanceFunctionCosine.Function()
+		t.distanceFuncName = DistanceFunctionCosine
+	}
+
+	var hasRoot byte
+	if err := binary.Read(r, binary.LittleEndian, &hasRoot); err != nil {
+		return err
+	}
+	if hasRoot == 0 {
+		t.root = nil
+		t.indexMap = nil
+		t.values = values[T]{}
+		t.version++
+		return nil
+	}
+
+	t.values = values[T]{}
+	t.indexMap = make(map[int32]*Point)
+	root, err := t.decodeNode(r, decodeValue)
+	if err != nil {
+		return err
+	}
+	t.root = root
+	t.version++
+	return nil
+}
+
+func (t *Tree[T]) encodeNode(w io.Writer, node *Node, encodeValue func(io.Writer, T) error) error {
+	if err := binary.Write(w, binary.LittleEndian, node.level); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, node.point.Magnitude); err != nil {
+		return err
+	}
+	if err := writeFloat32Slice(w, node.point.Vector); err != nil {
+		return err
+	}
+	value := t.values.value(node.point.index)
+	if err := encodeValue(w, value); err != nil {
+		return err
+	}
+	childCount := uint32(len(node.children))
+	if err := binary.Write(w, binary.LittleEndian, childCount); err != nil {
+		return err
+	}
+	for idx := range node.children {
+		if err := t.encodeNode(w, &node.children[idx], encodeValue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *Tree[T]) decodeNode(r io.Reader, decodeValue func(io.Reader) (T, error)) (*Node, error) {
+	var level int32
+	if err := binary.Read(r, binary.LittleEndian, &level); err != nil {
+		return nil, err
+	}
+	var magnitude float32
+	if err := binary.Read(r, binary.LittleEndian, &magnitude); err != nil {
+		return nil, err
+	}
+	vec, err := readFloat32Slice(r)
+	if err != nil {
+		return nil, err
+	}
+	val, err := decodeValue(r)
+	if err != nil {
+		return nil, err
+	}
+	index := t.values.put(val)
+	point := &Point{
+		index:     index,
+		Magnitude: magnitude,
+		Vector:    vec,
+	}
+	if t.indexMap == nil {
+		t.indexMap = make(map[int32]*Point)
+	}
+	t.indexMap[index] = point
+
+	var childCount uint32
+	if err := binary.Read(r, binary.LittleEndian, &childCount); err != nil {
+		return nil, err
+	}
+	children := make([]Node, childCount)
+	for i := uint32(0); i < childCount; i++ {
+		child, err := t.decodeNode(r, decodeValue)
+		if err != nil {
+			return nil, err
+		}
+		children[i] = *child
+	}
+	node := NewNode(point, level, t.base)
+	node.children = children
+	return &node, nil
+}
+
+func writeString(w io.Writer, value string) error {
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(value))); err != nil {
+		return err
+	}
+	if len(value) == 0 {
+		return nil
+	}
+	_, err := io.WriteString(w, value)
+	return err
+}
+
+func readString(r io.Reader) (string, error) {
+	var n uint32
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return "", err
+	}
+	if n == 0 {
+		return "", nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func writeFloat32Slice(w io.Writer, vec []float32) error {
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(vec))); err != nil {
+		return err
+	}
+	for _, v := range vec {
+		if err := binary.Write(w, binary.LittleEndian, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readFloat32Slice(r io.Reader) ([]float32, error) {
+	var n uint32
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return nil, err
+	}
+	vec := make([]float32, n)
+	for i := range vec {
+		if err := binary.Read(r, binary.LittleEndian, &vec[i]); err != nil {
+			return nil, err
+		}
+	}
+	return vec, nil
 }
 
 type nodeItem struct {
