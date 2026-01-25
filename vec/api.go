@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -296,6 +298,9 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("vec: CREATE expects at least 3 args, got %d", len(args))
 	}
+	if err := ctx.EnableConstraintSupport(); err != nil {
+		return nil, fmt.Errorf("vec: EnableConstraintSupport failed: %w", err)
+	}
 	// Determine declared column name from args (e.g. USING vec(doc_id)).
 	col := "doc_id"
 	optStart := 3
@@ -325,6 +330,9 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("vec: CONNECT expects at least 3 args, got %d", len(args))
+	}
+	if err := ctx.EnableConstraintSupport(); err != nil {
+		return nil, fmt.Errorf("vec: EnableConstraintSupport failed: %w", err)
 	}
 	// Determine declared column name from args (e.g. USING vec(value)).
 	col := "doc_id"
@@ -391,10 +399,12 @@ func (t *Table) BestIndex(info *vtab.IndexInfo) error {
 		info.IdxNum = idxDatasetScan
 	case datasetConstraint != nil && matchConstraint != nil && scoreConstraint == nil:
 		matchConstraint.ArgIndex = nextArg
+		matchConstraint.Omit = true
 		nextArg++
 		info.IdxNum = idxDatasetMatch
 	case datasetConstraint != nil && matchConstraint != nil && scoreConstraint != nil:
 		matchConstraint.ArgIndex = nextArg
+		matchConstraint.Omit = true
 		nextArg++
 		scoreConstraint.ArgIndex = nextArg
 		nextArg++
@@ -483,11 +493,7 @@ func (c *Cursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
 		}
 		c.dataset = dataset
 
-		qBlob, ok := vals[1].([]byte)
-		if !ok {
-			return fmt.Errorf("vec: expected MATCH arg as BLOB, got %T", vals[1])
-		}
-		qEmb, err := vector.DecodeEmbedding(qBlob)
+		qEmb, err := decodeMatchArg(vals[1])
 		if err != nil {
 			return err
 		}
@@ -546,6 +552,58 @@ func (c *Cursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
 	default:
 		return fmt.Errorf("vec: unsupported query plan")
 	}
+}
+
+func decodeMatchArg(v interface{}) ([]float32, error) {
+	switch val := v.(type) {
+	case []byte:
+		return vector.DecodeEmbedding(val)
+	case string:
+		return decodeMatchString(val)
+	default:
+		return nil, fmt.Errorf("vec: expected MATCH arg as BLOB or string, got %T", v)
+	}
+}
+
+func decodeMatchString(raw string) ([]float32, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, fmt.Errorf("vec: MATCH string is empty")
+	}
+	if strings.HasPrefix(s, "[") {
+		var floats []float64
+		if err := json.Unmarshal([]byte(s), &floats); err == nil {
+			vec := make([]float32, len(floats))
+			for i, f := range floats {
+				vec[i] = float32(f)
+			}
+			return vec, nil
+		}
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		if vec, err := vector.DecodeEmbedding(b); err == nil {
+			return vec, nil
+		}
+	}
+	if strings.Contains(s, ",") {
+		parts := strings.Split(s, ",")
+		vec := make([]float32, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			f, err := strconv.ParseFloat(p, 32)
+			if err != nil {
+				return nil, fmt.Errorf("vec: invalid MATCH float %q: %w", p, err)
+			}
+			vec = append(vec, float32(f))
+		}
+		if len(vec) > 0 {
+			return vec, nil
+		}
+	}
+	return nil, fmt.Errorf("vec: MATCH string must be base64-encoded embedding or JSON/CSV float list")
 }
 
 // Next advances the cursor.

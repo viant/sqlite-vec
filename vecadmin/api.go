@@ -41,6 +41,9 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("vec_admin: need at least 3 args")
 	}
+	if err := ctx.EnableConstraintSupport(); err != nil {
+		return nil, err
+	}
 	// Single TEXT column `op` reporting results.
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(op)", args[2])); err != nil {
 		return nil, err
@@ -50,6 +53,9 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("vec_admin: need at least 3 args")
+	}
+	if err := ctx.EnableConstraintSupport(); err != nil {
+		return nil, err
 	}
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(op)", args[2])); err != nil {
 		return nil, err
