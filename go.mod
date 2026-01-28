@@ -20,4 +20,4 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace modernc.org/sqlite => gitlab.com/adrianwit/sqlite v1.40.2-0.20260122162029-000bc1b9740a
+replace modernc.org/sqlite => gitlab.com/adrianwit/sqlite v1.40.2-0.20260127183639-396307fdbe7c

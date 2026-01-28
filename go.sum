@@ -14,8 +14,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/viant/vec v0.1.1-0.20240628004145-aad750556278 h1:t/x3ZoccWTkshYEwzhnW/VZe/enASwqs9IKcJPfI3cs=
 github.com/viant/vec v0.1.1-0.20240628004145-aad750556278/go.mod h1:d1coA6/d5WBePJe0nDhgE7aRYkMd7CMiRWSNid3tvds=
-gitlab.com/adrianwit/sqlite v1.40.2-0.20260122162029-000bc1b9740a h1:gp7dtrP32OzWwVcPe5uWgro5fibRVmE57fUhH5TsO20=
-gitlab.com/adrianwit/sqlite v1.40.2-0.20260122162029-000bc1b9740a/go.mod h1:CzbrU2lSB1DKUusvwGz7rqEKIq+NUd8GWuBBZDs9/nA=
+gitlab.com/adrianwit/sqlite v1.40.2-0.20260127183639-396307fdbe7c h1:Xvl5xWappACmHql5tHetS0i1dTnRx9jRP8qrfa23SpQ=
+gitlab.com/adrianwit/sqlite v1.40.2-0.20260127183639-396307fdbe7c/go.mod h1:CzbrU2lSB1DKUusvwGz7rqEKIq+NUd8GWuBBZDs9/nA=
 golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 h1:mgKeJMpvi0yx/sU5GsxQ7p6s2wtOnGAHZWCHUM4KGzY=
 golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546/go.mod h1:j/pmGrbnkbPtQfxEe5D0VQhZC6qKbfKifgD0oM7sR70=
 golang.org/x/mod v0.29.0 h1:HV8lRxZC4l2cr3Zq1LvtOsi/ThTgWnUk/y64QSs8GwA=

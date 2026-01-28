@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	idxapi "github.com/viant/sqlite-vec/index"
 	"github.com/viant/sqlite-vec/index/bruteforce"
@@ -33,8 +35,9 @@ type Table struct {
 	tableName string
 	shadow    string // qualified shadow table name (e.g. "main._vec_docs")
 
-	mu   sync.RWMutex
-	idxs map[string]idxapi.Index // cached per-dataset index
+	dbPathOnce sync.Once
+	dbPathErr  error
+	dbPath     string
 
 	indexKind string // "auto" (default), "brute", or "cover"
 	coverOpts coverOptions
@@ -174,64 +177,125 @@ func parseIndexOptions(args []string) indexOptions {
 	return opts
 }
 
-// Global registry of active tables keyed by shadow name for cache invalidation.
-var registry = struct {
-	mu       sync.RWMutex
-	byShadow map[string]map[*Table]struct{}
-}{byShadow: make(map[string]map[*Table]struct{})}
+// Global shared cache of indices keyed by db path/table/dataset for cross-connection reuse.
+var sharedCache = struct {
+	mu    sync.RWMutex
+	byKey map[string]*cacheEntry
+}{byKey: make(map[string]*cacheEntry)}
 
 var registerInvalidateOnce sync.Once
 
-func trackTable(t *Table) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	set := registry.byShadow[t.shadow]
-	if set == nil {
-		set = make(map[*Table]struct{})
-		registry.byShadow[t.shadow] = set
-	}
-	set[t] = struct{}{}
+type cacheEntry struct {
+	mu       sync.RWMutex
+	idx      idxapi.Index
+	building bool
+	cond     *sync.Cond
 }
 
-func untrackTable(t *Table) {
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	set := registry.byShadow[t.shadow]
-	if set == nil {
-		return
-	}
-	delete(set, t)
-	if len(set) == 0 {
-		delete(registry.byShadow, t.shadow)
-	}
+func newCacheEntry() *cacheEntry {
+	e := &cacheEntry{}
+	e.cond = sync.NewCond(&e.mu)
+	return e
 }
 
-// InvalidateCache clears cached indices for a given shadow/dataset across active tables.
+func (e *cacheEntry) get() idxapi.Index {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.idx
+}
+
+func (e *cacheEntry) set(idx idxapi.Index) {
+	e.mu.Lock()
+	e.idx = idx
+	e.mu.Unlock()
+}
+
+func (e *cacheEntry) waitForBuild() idxapi.Index {
+	e.mu.Lock()
+	for e.building {
+		e.cond.Wait()
+	}
+	idx := e.idx
+	e.mu.Unlock()
+	return idx
+}
+
+func (e *cacheEntry) startBuild() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.idx != nil || e.building {
+		return false
+	}
+	e.building = true
+	return true
+}
+
+func (e *cacheEntry) finishBuild() {
+	e.mu.Lock()
+	e.building = false
+	e.cond.Broadcast()
+	e.mu.Unlock()
+}
+
+func cacheKey(dbPath, tableName, dataset string) string {
+	return dbPath + "|" + tableName + "|" + dataset
+}
+
+func getCacheEntry(key string) *cacheEntry {
+	sharedCache.mu.RLock()
+	entry := sharedCache.byKey[key]
+	sharedCache.mu.RUnlock()
+	if entry != nil {
+		return entry
+	}
+	sharedCache.mu.Lock()
+	defer sharedCache.mu.Unlock()
+	if entry = sharedCache.byKey[key]; entry == nil {
+		entry = newCacheEntry()
+		sharedCache.byKey[key] = entry
+	}
+	return entry
+}
+
+func getSharedIndex(key string) idxapi.Index {
+	sharedCache.mu.RLock()
+	entry := sharedCache.byKey[key]
+	sharedCache.mu.RUnlock()
+	if entry == nil {
+		return nil
+	}
+	return entry.get()
+}
+
+func setSharedIndex(entry *cacheEntry, idx idxapi.Index) {
+	entry.set(idx)
+}
+
+// InvalidateCache clears cached indices for a given shadow/dataset across active connections.
 func InvalidateCache(shadow, dataset string) int {
-	registry.mu.RLock()
-	set := registry.byShadow[shadow]
-	var tables []*Table
-	for t := range set {
-		tables = append(tables, t)
-	}
-	registry.mu.RUnlock()
+	sharedCache.mu.Lock()
+	defer sharedCache.mu.Unlock()
 	count := 0
-	for _, t := range tables {
-		t.mu.Lock()
-		if t.idxs == nil {
-			t.mu.Unlock()
-			continue
-		}
-		if dataset == "" {
-			count += len(t.idxs)
-			t.idxs = make(map[string]idxapi.Index)
-		} else {
-			if _, ok := t.idxs[dataset]; ok {
-				delete(t.idxs, dataset)
+	tableName := tableNameFromShadow(shadow)
+	if tableName == "" {
+		tableName = shadow
+	}
+	if dataset == "" {
+		pattern := "|" + tableName + "|"
+		for k, entry := range sharedCache.byKey {
+			if strings.Contains(k, pattern) {
+				entry.set(nil)
 				count++
 			}
 		}
-		t.mu.Unlock()
+		return count
+	}
+	suffix := "|" + tableName + "|" + dataset
+	for k, entry := range sharedCache.byKey {
+		if strings.HasSuffix(k, suffix) {
+			entry.set(nil)
+			count++
+		}
 	}
 	return count
 }
@@ -316,13 +380,12 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 		return nil, err
 	}
 	opts := parseIndexOptions(args[optStart:])
-	t := &Table{db: m.db, dbName: args[1], tableName: args[2], idxs: make(map[string]idxapi.Index)}
+	t := &Table{db: m.db, dbName: args[1], tableName: args[2]}
 	// Initialize shadow name eagerly so subsequent statements on the same connection work.
 	t.shadow = t.qualifiedShadow()
 	t.indexKind = opts.kind
 	t.coverOpts = opts.cover
 	// Defer vector_storage creation until first use to avoid cross-connection DDL during xCreate.
-	trackTable(t)
 	return t, nil
 }
 
@@ -349,14 +412,13 @@ func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 		return nil, err
 	}
 	opts := parseIndexOptions(args[optStart:])
-	t := &Table{db: m.db, dbName: args[1], tableName: args[2], idxs: make(map[string]idxapi.Index)}
+	t := &Table{db: m.db, dbName: args[1], tableName: args[2]}
 	// Reconstruct shadow name and ensure vector_storage exists.
 	t.shadow = t.qualifiedShadow()
 	// Parse options if provided (args mirror Create's argv).
 	t.indexKind = opts.kind
 	t.coverOpts = opts.cover
 	// Defer vector_storage creation until first use.
-	trackTable(t)
 	return t, nil
 }
 
@@ -422,10 +484,10 @@ func (t *Table) BestIndex(info *vtab.IndexInfo) error {
 func (t *Table) Open() (vtab.Cursor, error) { return &Cursor{table: t}, nil }
 
 // Disconnect cleans up per-connection resources.
-func (t *Table) Disconnect() error { untrackTable(t); return nil }
+func (t *Table) Disconnect() error { return nil }
 
 // Destroy drops nothing for now; shadow persists.
-func (t *Table) Destroy() error { untrackTable(t); return nil }
+func (t *Table) Destroy() error { return nil }
 
 // Filter computes the result set based on idxNum/vals.
 func (c *Cursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
@@ -708,6 +770,21 @@ CREATE TABLE IF NOT EXISTS vector_storage (
 	return err
 }
 
+func ensureVectorStorageLocks(db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("vec: db is nil")
+	}
+	_, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS vector_storage_locks (
+    shadow_table_name TEXT NOT NULL,
+    dataset_id        TEXT NOT NULL DEFAULT '',
+    owner             TEXT NOT NULL,
+    locked_at         INTEGER NOT NULL,
+    PRIMARY KEY (shadow_table_name, dataset_id)
+)`)
+	return err
+}
+
 // qualifiedShadow returns a fully-qualified shadow table name.
 func (t *Table) qualifiedShadow() string {
 	// Use a deterministic shadow name to avoid clashes, prefixed with _vec_.
@@ -718,53 +795,216 @@ func (t *Table) qualifiedShadow() string {
 	return t.dbName + "." + base
 }
 
+func tableNameFromShadow(shadow string) string {
+	if shadow == "" {
+		return ""
+	}
+	if i := strings.Index(shadow, "._vec_"); i >= 0 {
+		return shadow[i+len("._vec_"):]
+	}
+	if strings.HasPrefix(shadow, "_vec_") {
+		return strings.TrimPrefix(shadow, "_vec_")
+	}
+	return ""
+}
+
+func resolveDbPath(ctx context.Context, db *sql.DB, dbName string) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("vec: db is nil")
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name, file FROM pragma_database_list`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, file string
+		if err := rows.Scan(&name, &file); err != nil {
+			return "", err
+		}
+		if dbName == "" {
+			if name == "main" {
+				if file == "" {
+					return name, nil
+				}
+				return file, nil
+			}
+		} else if name == dbName {
+			if file == "" {
+				return name, nil
+			}
+			return file, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if dbName != "" {
+		return dbName, nil
+	}
+	return "main", nil
+}
+
+func (t *Table) cachedDbPath(ctx context.Context) string {
+	t.dbPathOnce.Do(func() {
+		path, err := resolveDbPath(ctx, t.db, t.dbName)
+		if err != nil {
+			t.dbPathErr = err
+			if t.dbName != "" {
+				t.dbPath = t.dbName
+			} else {
+				t.dbPath = "main"
+			}
+			return
+		}
+		t.dbPath = path
+	})
+	return t.dbPath
+}
+
+func (t *Table) loadPersistedIndex(ctx context.Context, dataset string) (idxapi.Index, bool, error) {
+	var blob []byte
+	err := t.db.QueryRowContext(ctx, `SELECT "index" FROM vector_storage WHERE shadow_table_name = ? AND dataset_id = ?`, t.shadow, dataset).Scan(&blob)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if len(blob) == 0 {
+		return nil, false, nil
+	}
+	if isCoverBlob(blob) {
+		c := t.newCoverIndex()
+		if err := c.UnmarshalBinary(blob); err == nil {
+			return c, true, nil
+		}
+		return nil, false, nil
+	}
+	b := &bruteforce.Index{}
+	if err := b.UnmarshalBinary(blob); err == nil {
+		return b, true, nil
+	}
+	return nil, false, nil
+}
+
+const (
+	lockRetryDelay = 50 * time.Millisecond
+	lockStaleAfter = 2 * time.Minute
+)
+
+var lockOwnerID = fmt.Sprintf("pid:%d-%d", os.Getpid(), time.Now().UnixNano())
+
+func acquireIndexBuildLock(ctx context.Context, db *sql.DB, shadow, dataset string) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		now := time.Now().Unix()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO vector_storage_locks(shadow_table_name, dataset_id, owner, locked_at) VALUES(?, ?, ?, ?)`, shadow, dataset, lockOwnerID, now); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+		var owner string
+		var lockedAt int64
+		if err := tx.QueryRowContext(ctx, `SELECT owner, locked_at FROM vector_storage_locks WHERE shadow_table_name = ? AND dataset_id = ?`, shadow, dataset).Scan(&owner, &lockedAt); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+		if owner != lockOwnerID && lockedAt <= time.Now().Add(-lockStaleAfter).Unix() {
+			res, err := tx.ExecContext(ctx, `UPDATE vector_storage_locks SET owner = ?, locked_at = ? WHERE shadow_table_name = ? AND dataset_id = ? AND locked_at = ?`, lockOwnerID, now, shadow, dataset, lockedAt)
+			if err != nil {
+				_ = tx.Rollback()
+				return nil, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				owner = lockOwnerID
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		if owner == lockOwnerID {
+			return func() {
+				_, _ = db.ExecContext(context.Background(), `DELETE FROM vector_storage_locks WHERE shadow_table_name = ? AND dataset_id = ? AND owner = ?`, shadow, dataset, lockOwnerID)
+			}, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(lockRetryDelay):
+		}
+	}
+}
+
 // ensureIndex loads or builds an in-memory index and persists it in vector_storage.
 func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, error) {
 	if strings.TrimSpace(dataset) == "" {
 		return nil, fmt.Errorf("vec: dataset_id is required for ensureIndex")
 	}
+	if err := t.ensureShadow(); err != nil {
+		return nil, err
+	}
+	if err := ensureVectorStorage(t.db); err != nil {
+		return nil, err
+	}
+	if err := ensureVectorStorageLocks(t.db); err != nil {
+		return nil, err
+	}
 
-	t.mu.RLock()
-	if idx := t.idxs[dataset]; idx != nil {
-		t.mu.RUnlock()
+	dbPath := t.cachedDbPath(ctx)
+	key := cacheKey(dbPath, t.tableName, dataset)
+	entry := getCacheEntry(key)
+	if idx := entry.get(); idx != nil {
 		return idx, nil
 	}
-	t.mu.RUnlock()
 
-	var blob []byte
-	err := t.db.QueryRowContext(ctx, `SELECT "index" FROM vector_storage WHERE shadow_table_name = ? AND dataset_id = ?`, t.shadow, dataset).Scan(&blob)
-	hasPersisted := (err == nil && len(blob) > 0)
-	if hasPersisted {
-		var idx idxapi.Index
-		if isCoverBlob(blob) {
-			c := t.newCoverIndex()
-			if err := c.UnmarshalBinary(blob); err == nil {
-				idx = c
-			}
-		} else {
-			b := &bruteforce.Index{}
-			if err := b.UnmarshalBinary(blob); err == nil {
-				idx = b
-			}
-		}
-		if idx != nil {
-			t.mu.Lock()
-			if t.idxs == nil {
-				t.idxs = make(map[string]idxapi.Index)
-			}
-			t.idxs[dataset] = idx
-			t.mu.Unlock()
+	if idx, ok, err := t.loadPersistedIndex(ctx, dataset); err != nil {
+		return nil, err
+	} else if ok {
+		setSharedIndex(entry, idx)
+		return idx, nil
+	}
+
+	started := false
+	for !started {
+		if idx := entry.get(); idx != nil {
 			return idx, nil
 		}
-		// fall through to rebuild on decode error
+		if entry.startBuild() {
+			started = true
+			break
+		}
+		if idx := entry.waitForBuild(); idx != nil {
+			return idx, nil
+		}
+	}
+	defer entry.finishBuild()
+
+	if idx, ok, err := t.loadPersistedIndex(ctx, dataset); err != nil {
+		return nil, err
+	} else if ok {
+		setSharedIndex(entry, idx)
+		return idx, nil
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.idxs == nil {
-		t.idxs = make(map[string]idxapi.Index)
+	unlock, err := acquireIndexBuildLock(ctx, t.db, t.shadow, dataset)
+	if err != nil {
+		return nil, err
 	}
-	if idx := t.idxs[dataset]; idx != nil {
+	defer unlock()
+
+	if idx := entry.get(); idx != nil {
+		return idx, nil
+	}
+	if idx, ok, err := t.loadPersistedIndex(ctx, dataset); err != nil {
+		return nil, err
+	} else if ok {
+		setSharedIndex(entry, idx)
 		return idx, nil
 	}
 
@@ -809,20 +1049,19 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 			return nil, err
 		}
 		built = c
-		t.idxs[dataset] = c
 	default:
 		bf := &bruteforce.Index{}
 		if err := bf.Build(ids, vecs); err != nil {
 			return nil, err
 		}
 		built = bf
-		t.idxs[dataset] = bf
 	}
 
 	if data, err := built.MarshalBinary(); err == nil {
 		_, _ = t.db.ExecContext(ctx, `INSERT OR REPLACE INTO vector_storage(shadow_table_name, dataset_id, "index") VALUES(?, ?, ?)`, t.shadow, dataset, data)
 	}
-	return t.idxs[dataset], nil
+	setSharedIndex(entry, built)
+	return built, nil
 }
 
 // lookupRow resolves rowid for a given dataset/id pair.
