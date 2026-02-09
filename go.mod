@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/viant/vec v0.1.1-0.20240628004145-aad750556278
-	modernc.org/sqlite v1.40.2-0.20251208121757-c233febc9136
+	modernc.org/sqlite v1.45.0
 )
 
 require (
@@ -20,4 +20,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-replace modernc.org/sqlite => gitlab.com/adrianwit/sqlite v1.40.2-0.20260127183639-396307fdbe7c
