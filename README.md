@@ -120,7 +120,9 @@ func main() {
         log.Fatalf("vec.Register failed: %v", err)
     }
 
-    if _, err := db.Exec(`CREATE VIRTUAL TABLE vec_docs USING vec(doc_id)`); err != nil {
+    // Include dbpath so the vec table can resolve the correct backing file
+    // when multiple SQLite databases are used in the same process.
+    if _, err := db.Exec(`CREATE VIRTUAL TABLE vec_docs USING vec(doc_id, dbpath='./vec_demo.sqlite')`); err != nil {
         log.Fatalf("CREATE VIRTUAL TABLE failed: %v", err)
     }
 
