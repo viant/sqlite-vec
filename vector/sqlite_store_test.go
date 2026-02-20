@@ -62,4 +62,3 @@ func TestSQLiteStore_AddSearchRemove(t *testing.T) {
 		}
 	}
 }
-

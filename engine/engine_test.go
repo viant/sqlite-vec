@@ -18,4 +18,3 @@ func TestOpenInMemory(t *testing.T) {
 		t.Fatalf("INSERT failed: %v", err)
 	}
 }
-

@@ -5,4 +5,3 @@
 //   - Schema helpers to create a docs table
 //   - Embedding encoding (BLOB) and distance functions
 package vector
-

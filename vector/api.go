@@ -41,4 +41,3 @@ type Store interface {
 	// underlying SQLite tables and the vector index.
 	Remove(ctx context.Context, id string) error
 }
-

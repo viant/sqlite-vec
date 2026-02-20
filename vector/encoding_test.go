@@ -41,4 +41,3 @@ func TestEncodeDecodeEmbedding_Empty(t *testing.T) {
 		t.Fatalf("expected empty slice for nil blob, got len=%d", len(vec))
 	}
 }
-

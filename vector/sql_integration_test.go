@@ -10,19 +10,19 @@ import (
 // used in an ORDER BY clause over the docs table, using embeddings stored as
 // BLOBs via EncodeEmbedding.
 func TestSQLOrderByVecCosine(t *testing.T) {
-    // Register functions before any connection work
-    if err := engine.RegisterVectorFunctions(nil); err != nil {
-        t.Fatalf("RegisterVectorFunctions: %v", err)
-    }
-    db, err := engine.Open(":memory:")
+	// Register functions before any connection work
+	if err := engine.RegisterVectorFunctions(nil); err != nil {
+		t.Fatalf("RegisterVectorFunctions: %v", err)
+	}
+	db, err := engine.Open(":memory:")
 	if err != nil {
 		t.Fatalf("engine.Open(:memory:) failed: %v", err)
 	}
 	defer db.Close()
 
-    if err := EnsureSchema(db); err != nil {
-        t.Fatalf("EnsureSchema failed: %v", err)
-    }
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema failed: %v", err)
+	}
 
 	// Two simple embeddings: e1=[1,0], e2=[0,1]; query=[1,0].
 	e1, err := EncodeEmbedding([]float32{1, 0})

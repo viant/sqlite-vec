@@ -2,4 +2,3 @@
 // brute-force implementation. It preserves a stable API so the internals can
 // be switched to a real cover tree without changing callers.
 package cover
-

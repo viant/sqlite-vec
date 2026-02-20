@@ -20,4 +20,3 @@ func EnsureSchema(db *sql.DB) error {
 	_, err := db.Exec(docsSchema)
 	return err
 }
-

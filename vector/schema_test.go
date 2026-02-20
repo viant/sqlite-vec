@@ -24,4 +24,3 @@ func TestEnsureSchema(t *testing.T) {
 		t.Fatalf("insert into docs failed: %v", err)
 	}
 }
-

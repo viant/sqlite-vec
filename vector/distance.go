@@ -42,4 +42,3 @@ func L2Distance(a, b []float32) (float64, error) {
 	}
 	return math.Sqrt(sum), nil
 }
-

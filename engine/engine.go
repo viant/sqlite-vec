@@ -1,9 +1,9 @@
 package engine
 
 import (
-    "database/sql"
+	"database/sql"
 
-    _ "modernc.org/sqlite" // register pure-Go SQLite driver
+	_ "modernc.org/sqlite" // register pure-Go SQLite driver
 )
 
 // Open opens a SQLite database using the modernc.org/sqlite driver.

@@ -39,4 +39,3 @@ func DecodeEmbedding(b []byte) ([]float32, error) {
 	}
 	return vec, nil
 }
-

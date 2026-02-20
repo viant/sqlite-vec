@@ -30,4 +30,3 @@ func TestL2Distance(t *testing.T) {
 		t.Fatalf("L2Distance(0,0)-(3,4) = %v, want 5", d)
 	}
 }
-

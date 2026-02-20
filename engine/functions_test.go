@@ -8,11 +8,11 @@ import (
 )
 
 func TestRegisterVectorFunctionsAndUse(t *testing.T) {
-    // Register globally before first connection so functions are available.
-    if err := RegisterVectorFunctions(nil); err != nil {
-        t.Fatalf("RegisterVectorFunctions failed: %v", err)
-    }
-    db, err := Open(":memory:")
+	// Register globally before first connection so functions are available.
+	if err := RegisterVectorFunctions(nil); err != nil {
+		t.Fatalf("RegisterVectorFunctions failed: %v", err)
+	}
+	db, err := Open(":memory:")
 	if err != nil {
 		t.Fatalf("Open(:memory:) failed: %v", err)
 	}
