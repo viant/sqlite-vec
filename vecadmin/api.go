@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/viant/sqlite-vec/engine"
 	"github.com/viant/sqlite-vec/index/bruteforce"
 	"github.com/viant/sqlite-vec/vector"
 	"modernc.org/sqlite/vtab"
@@ -20,7 +21,10 @@ import (
 // Returns a single row with op='reindexed:<count>' on success.
 type Module struct{ db *sql.DB }
 
-type Table struct{ db *sql.DB }
+type Table struct {
+	db    *sql.DB
+	ownDB bool
+}
 
 type Cursor struct {
 	table *Table
@@ -48,7 +52,14 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(op)", args[2])); err != nil {
 		return nil, err
 	}
-	return &Table{db: m.db}, nil
+	db, own, err := resolveAdminDB(args[3:])
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		db = m.db
+	}
+	return &Table{db: db, ownDB: own}, nil
 }
 func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if len(args) < 3 {
@@ -60,7 +71,14 @@ func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(op)", args[2])); err != nil {
 		return nil, err
 	}
-	return &Table{db: m.db}, nil
+	db, own, err := resolveAdminDB(args[3:])
+	if err != nil {
+		return nil, err
+	}
+	if db == nil {
+		db = m.db
+	}
+	return &Table{db: db, ownDB: own}, nil
 }
 
 func (t *Table) BestIndex(info *vtab.IndexInfo) error {
@@ -79,8 +97,41 @@ func (t *Table) BestIndex(info *vtab.IndexInfo) error {
 }
 
 func (t *Table) Open() (vtab.Cursor, error) { return &Cursor{table: t}, nil }
-func (t *Table) Disconnect() error          { return nil }
-func (t *Table) Destroy() error             { return nil }
+func (t *Table) Disconnect() error {
+	if t.ownDB && t.db != nil {
+		_ = t.db.Close()
+		t.db = nil
+	}
+	return nil
+}
+func (t *Table) Destroy() error {
+	if t.ownDB && t.db != nil {
+		_ = t.db.Close()
+		t.db = nil
+	}
+	return nil
+}
+
+func resolveAdminDB(args []string) (*sql.DB, bool, error) {
+	dbPath := ""
+	for _, raw := range args {
+		a := strings.TrimSpace(raw)
+		la := strings.ToLower(a)
+		if strings.HasPrefix(la, "dbpath=") {
+			dbPath = strings.TrimSpace(a[len("dbpath="):])
+			break
+		}
+	}
+	if dbPath == "" {
+		return nil, false, nil
+	}
+	db, err := engine.Open(dbPath)
+	if err != nil {
+		return nil, false, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, true, nil
+}
 
 func (c *Cursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
 	c.rows = nil

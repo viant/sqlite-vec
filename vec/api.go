@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/viant/sqlite-vec/engine"
 	idxapi "github.com/viant/sqlite-vec/index"
 	"github.com/viant/sqlite-vec/index/bruteforce"
 	covidx "github.com/viant/sqlite-vec/index/cover"
@@ -35,9 +37,11 @@ type Table struct {
 	tableName string
 	shadow    string // qualified shadow table name (e.g. "main._vec_docs")
 
-	dbPathOnce sync.Once
-	dbPathErr  error
-	dbPath     string
+	dbPathOnce     sync.Once
+	dbPathErr      error
+	dbPath         string
+	dbPathOverride string
+	ownDB          bool
 
 	indexKind string // "auto" (default), "brute", or "cover"
 	coverOpts coverOptions
@@ -175,6 +179,60 @@ func parseIndexOptions(args []string) indexOptions {
 		}
 	}
 	return opts
+}
+
+func extractDBPath(args []string) (string, []string) {
+	if len(args) == 0 {
+		return "", args
+	}
+	var dbPath string
+	out := make([]string, 0, len(args))
+	for _, raw := range args {
+		a := strings.TrimSpace(raw)
+		la := strings.ToLower(a)
+		if strings.HasPrefix(la, "dbpath=") {
+			dbPath = strings.TrimSpace(a[len("dbpath="):])
+			continue
+		}
+		out = append(out, raw)
+	}
+	return dbPath, out
+}
+
+func openDBForPath(dbPath string) (*sql.DB, error) {
+	norm := normalizeDBPath(dbPath)
+	if strings.TrimSpace(norm) == "" {
+		return nil, fmt.Errorf("vec: dbpath is empty")
+	}
+	db, err := engine.Open(norm)
+	if err != nil {
+		return nil, err
+	}
+	// Keep a single underlying connection so vtab registration is visible.
+	db.SetMaxOpenConns(1)
+	return db, nil
+}
+
+func normalizeDBPath(dbPath string) string {
+	path := strings.TrimSpace(dbPath)
+	if path == "" {
+		return path
+	}
+	// Trim surrounding quotes if present.
+	if len(path) >= 2 {
+		if (path[0] == '\'' && path[len(path)-1] == '\'') || (path[0] == '"' && path[len(path)-1] == '"') {
+			path = path[1 : len(path)-1]
+		}
+	}
+	// Convert file:// URL to filesystem path.
+	if strings.HasPrefix(strings.ToLower(path), "file://") {
+		if u, err := url.Parse(path); err == nil {
+			if u.Path != "" {
+				path = u.Path
+			}
+		}
+	}
+	return path
 }
 
 // Global shared cache of indices keyed by db path/table/dataset for cross-connection reuse.
@@ -379,8 +437,19 @@ func (m *Module) Create(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(dataset_id TEXT, %s TEXT, match_score REAL HIDDEN)", args[2], col)); err != nil {
 		return nil, err
 	}
-	opts := parseIndexOptions(args[optStart:])
+	dbPath, optArgs := extractDBPath(args[optStart:])
+	opts := parseIndexOptions(optArgs)
 	t := &Table{db: m.db, dbName: args[1], tableName: args[2]}
+	if strings.TrimSpace(dbPath) != "" {
+		opened, err := openDBForPath(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		t.db = opened
+		t.dbName = "main"
+		t.dbPathOverride = dbPath
+		t.ownDB = true
+	}
 	// Initialize shadow name eagerly so subsequent statements on the same connection work.
 	t.shadow = t.qualifiedShadow()
 	t.indexKind = opts.kind
@@ -411,8 +480,19 @@ func (m *Module) Connect(ctx vtab.Context, args []string) (vtab.Table, error) {
 	if err := ctx.Declare(fmt.Sprintf("CREATE TABLE %s(dataset_id TEXT, %s TEXT, match_score REAL HIDDEN)", args[2], col)); err != nil {
 		return nil, err
 	}
-	opts := parseIndexOptions(args[optStart:])
+	dbPath, optArgs := extractDBPath(args[optStart:])
+	opts := parseIndexOptions(optArgs)
 	t := &Table{db: m.db, dbName: args[1], tableName: args[2]}
+	if strings.TrimSpace(dbPath) != "" {
+		opened, err := openDBForPath(dbPath)
+		if err != nil {
+			return nil, err
+		}
+		t.db = opened
+		t.dbName = "main"
+		t.dbPathOverride = dbPath
+		t.ownDB = true
+	}
 	// Reconstruct shadow name and ensure vector_storage exists.
 	t.shadow = t.qualifiedShadow()
 	// Parse options if provided (args mirror Create's argv).
@@ -484,10 +564,22 @@ func (t *Table) BestIndex(info *vtab.IndexInfo) error {
 func (t *Table) Open() (vtab.Cursor, error) { return &Cursor{table: t}, nil }
 
 // Disconnect cleans up per-connection resources.
-func (t *Table) Disconnect() error { return nil }
+func (t *Table) Disconnect() error {
+	if t.ownDB && t.db != nil {
+		_ = t.db.Close()
+		t.db = nil
+	}
+	return nil
+}
 
 // Destroy drops nothing for now; shadow persists.
-func (t *Table) Destroy() error { return nil }
+func (t *Table) Destroy() error {
+	if t.ownDB && t.db != nil {
+		_ = t.db.Close()
+		t.db = nil
+	}
+	return nil
+}
 
 // Filter computes the result set based on idxNum/vals.
 func (c *Cursor) Filter(idxNum int, idxStr string, vals []vtab.Value) error {
@@ -846,6 +938,9 @@ func resolveDbPath(ctx context.Context, db *sql.DB, dbName string) (string, erro
 }
 
 func (t *Table) cachedDbPath(ctx context.Context) string {
+	if strings.TrimSpace(t.dbPathOverride) != "" {
+		return t.dbPathOverride
+	}
 	t.dbPathOnce.Do(func() {
 		path, err := resolveDbPath(ctx, t.db, t.dbName)
 		if err != nil {
