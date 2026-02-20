@@ -173,6 +173,7 @@ Pass tuning flags directly in the `USING vec(...)` clause:
 ```sql
 CREATE VIRTUAL TABLE vec_docs USING vec(
   doc_id,
+  dbpath=/tmp/vec_shadow.sqlite,
   index=cover,
   cover_base=1.4,
   cover_bound=level,
@@ -184,6 +185,10 @@ CREATE VIRTUAL TABLE vec_docs USING vec(
 Available keys (all optional):
 
 - `index=auto|cover|brute` – choose the index implementation (`auto` default).
+- `dbpath=<file>` – override the SQLite database file used for the shadow table
+  lookup and index cache. Use this when the connection has multiple attached
+  databases or when the shadow table lives outside the main file. Accepts plain
+  paths or `file:` URIs.
 - `cover_base=<float>` – override the cover-tree base (>1). Larger bases produce
   shallower trees (faster builds) with looser bounds; smaller bases do the opposite.
 - `cover_bound=per_node|level` – pick the pruning strategy (per-node cached radii
