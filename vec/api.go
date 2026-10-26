@@ -43,6 +43,7 @@ type Table struct {
 	dbPathOverride string
 	ownDB          bool
 
+	readOnly  bool   // Context-aware searches never write index state.
 	indexKind string // "auto" (default), "brute", or "cover"
 	coverOpts coverOptions
 }
@@ -244,16 +245,15 @@ var sharedCache = struct {
 var registerInvalidateOnce sync.Once
 
 type cacheEntry struct {
-	mu       sync.RWMutex
-	idx      idxapi.Index
-	building bool
-	cond     *sync.Cond
+	mu         sync.RWMutex
+	idx        idxapi.Index
+	building   bool
+	done       chan struct{}
+	generation uint64
 }
 
 func newCacheEntry() *cacheEntry {
-	e := &cacheEntry{}
-	e.cond = sync.NewCond(&e.mu)
-	return e
+	return &cacheEntry{}
 }
 
 func (e *cacheEntry) get() idxapi.Index {
@@ -265,17 +265,25 @@ func (e *cacheEntry) get() idxapi.Index {
 func (e *cacheEntry) set(idx idxapi.Index) {
 	e.mu.Lock()
 	e.idx = idx
+	if idx == nil {
+		e.generation++
+	}
 	e.mu.Unlock()
 }
 
-func (e *cacheEntry) waitForBuild() idxapi.Index {
-	e.mu.Lock()
-	for e.building {
-		e.cond.Wait()
+func (e *cacheEntry) waitForBuild(ctx context.Context) (idxapi.Index, error) {
+	e.mu.RLock()
+	done := e.done
+	building := e.building
+	e.mu.RUnlock()
+	if building {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	idx := e.idx
-	e.mu.Unlock()
-	return idx
+	return e.get(), ctx.Err()
 }
 
 func (e *cacheEntry) startBuild() bool {
@@ -285,13 +293,14 @@ func (e *cacheEntry) startBuild() bool {
 		return false
 	}
 	e.building = true
+	e.done = make(chan struct{})
 	return true
 }
 
 func (e *cacheEntry) finishBuild() {
 	e.mu.Lock()
 	e.building = false
-	e.cond.Broadcast()
+	close(e.done)
 	e.mu.Unlock()
 }
 
@@ -958,6 +967,9 @@ func (t *Table) cachedDbPath(ctx context.Context) string {
 }
 
 func (t *Table) loadPersistedIndex(ctx context.Context, dataset string) (idxapi.Index, bool, error) {
+	if t.readOnly {
+		return nil, false, nil
+	}
 	var blob []byte
 	err := t.db.QueryRowContext(ctx, `SELECT "index" FROM vector_storage WHERE shadow_table_name = ? AND dataset_id = ?`, t.shadow, dataset).Scan(&blob)
 	if err != nil {
@@ -1041,14 +1053,16 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 	if strings.TrimSpace(dataset) == "" {
 		return nil, fmt.Errorf("vec: dataset_id is required for ensureIndex")
 	}
-	if err := t.ensureShadow(); err != nil {
-		return nil, err
-	}
-	if err := ensureVectorStorage(t.db); err != nil {
-		return nil, err
-	}
-	if err := ensureVectorStorageLocks(t.db); err != nil {
-		return nil, err
+	if !t.readOnly {
+		if err := t.ensureShadow(); err != nil {
+			return nil, err
+		}
+		if err := ensureVectorStorage(t.db); err != nil {
+			return nil, err
+		}
+		if err := ensureVectorStorageLocks(t.db); err != nil {
+			return nil, err
+		}
 	}
 
 	dbPath := t.cachedDbPath(ctx)
@@ -1074,7 +1088,9 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 			started = true
 			break
 		}
-		if idx := entry.waitForBuild(); idx != nil {
+		if idx, err := entry.waitForBuild(ctx); err != nil {
+			return nil, err
+		} else if idx != nil {
 			return idx, nil
 		}
 	}
@@ -1087,11 +1103,13 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 		return idx, nil
 	}
 
-	unlock, err := acquireIndexBuildLock(ctx, t.db, t.shadow, dataset)
-	if err != nil {
-		return nil, err
+	if !t.readOnly {
+		unlock, err := acquireIndexBuildLock(ctx, t.db, t.shadow, dataset)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	if idx := entry.get(); idx != nil {
 		return idx, nil
@@ -1102,6 +1120,10 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 		setSharedIndex(entry, idx)
 		return idx, nil
 	}
+
+	entry.mu.RLock()
+	generation := entry.generation
+	entry.mu.RUnlock()
 
 	q := fmt.Sprintf("SELECT id, embedding FROM %s WHERE dataset_id = ? AND embedding IS NOT NULL", t.shadow)
 	rows, err := t.db.QueryContext(ctx, q, dataset)
@@ -1152,10 +1174,16 @@ func (t *Table) ensureIndex(ctx context.Context, dataset string) (idxapi.Index, 
 		built = bf
 	}
 
-	if data, err := built.MarshalBinary(); err == nil {
-		_, _ = t.db.ExecContext(ctx, `INSERT OR REPLACE INTO vector_storage(shadow_table_name, dataset_id, "index") VALUES(?, ?, ?)`, t.shadow, dataset, data)
+	if !t.readOnly {
+		if data, err := built.MarshalBinary(); err == nil {
+			_, _ = t.db.ExecContext(ctx, `INSERT OR REPLACE INTO vector_storage(shadow_table_name, dataset_id, "index") VALUES(?, ?, ?)`, t.shadow, dataset, data)
+		}
 	}
-	setSharedIndex(entry, built)
+	entry.mu.Lock()
+	if entry.generation == generation {
+		entry.idx = built
+	}
+	entry.mu.Unlock()
 	return built, nil
 }
 
